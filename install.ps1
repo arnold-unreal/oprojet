@@ -1,3 +1,4 @@
+& 'C:\Program Files\Python312\python.exe' -m pip install pywin32 websockets psutil pynvml -q
 # Arrêter et supprimer si déjà installé
 Stop-Service AgentMonitor -Force -ErrorAction SilentlyContinue
 sc.exe delete AgentMonitor | Out-Null
