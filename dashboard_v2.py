@@ -1,12 +1,9 @@
 """
-RP2040 Monitor - Dashboard TUI (PC1)
-Se connecte à l'agent via WebSocket et affiche les métriques en temps réel.
-Inclut aussi un terminal à distance pour exécuter des commandes sur PC2.
+RP2040 Monitor - Dashboard v2 avec Terminal Interactif
 """
 
 import asyncio
 import json
-import os
 import sys
 import argparse
 import time
@@ -18,11 +15,9 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 from rich.text import Text
 from rich import box
-from rich.input import Prompt
 
 console = Console()
 
@@ -35,17 +30,12 @@ gpu_hist = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
 _last_data: dict = {}
 _status: str = "Connexion en cours…"
 _latency_ms: float = 0.0
-_command_output: str = ""
-_command_error: str = ""
-_websocket = None
+_terminal_output: list = []
+_command_input: str = ""
+_ws_client = None
 
-
-# ---------------------------------------------------------------------------
-# Rendu
-# ---------------------------------------------------------------------------
 
 def sparkline(values: deque, width: int = 38) -> str:
-    """Mini graphe ASCII avec les blocs ▁▂▃▄▅▆▇█."""
     bars = " ▁▂▃▄▅▆▇█"
     vals = list(values)[-width:]
     if not vals or max(vals) == 0:
@@ -158,27 +148,23 @@ def build_layout(data: dict) -> Layout:
     right_col.add_row(disk_panel)
     layout["right"].update(right_col)
 
-    # ── Terminal à distance ──────────────────────────────────────────────────
-    term_content = ""
-    if _command_error:
-        term_content += f"[bold red]❌ Erreur :[/] {_command_error}\n\n"
-    if _command_output:
-        term_content += f"[cyan]$ Résultat :[/]\n{_command_output[:500]}"
-    else:
-        term_content += "[dim]En attente de commande...[/]"
-    
-    layout["terminal"].update(Panel(
-        term_content,
-        title="[bold yellow]🖥  Terminal à distance (taper 'cmd' pour exécuter)[/]",
-        box=box.ROUNDED,
-    ))
+    # ── Terminal ────────────────────────────────────────────────────────────
+    terminal_content = "\n".join(_terminal_output[-10:])  # Dernières 10 lignes
+    terminal_panel = Panel(
+        terminal_content or "[dim]En attente de commandes...[/]",
+        title="[bold yellow]Terminal à Distance[/]",
+        box=box.ROUNDED
+    )
+    layout["terminal"].update(terminal_panel)
 
     # ── Footer ──────────────────────────────────────────────────────────────
     layout["footer"].update(Panel(
         Text.assemble(
-            ("  q", "bold yellow"), " quitter   ",
-            ("  Ctrl+C", "bold yellow"), " reconnecter   ",
-            "   status : ", (_status, "cyan")
+            ("  Commande : ", "cyan"),
+            (_command_input, "bold white"),
+            ("   |   ", "dim"),
+            ("q", "bold yellow"), " quitter   ",
+            ("status : ", "dim"), (_status, "cyan")
         ),
         box=box.HORIZONTALS,
     ))
@@ -186,31 +172,27 @@ def build_layout(data: dict) -> Layout:
     return layout
 
 
-# ---------------------------------------------------------------------------
-# Boucle WebSocket
-# ---------------------------------------------------------------------------
-
 async def send_command(cmd: str):
-    """Envoie une commande à l'agent et attend le résultat."""
-    global _command_output, _command_error, _websocket
+    """Envoie une commande à l'agent"""
+    global _terminal_output, _ws_client
     
-    if not _websocket:
-        _command_error = "Pas connecté à l'agent"
+    if not _ws_client:
         return
     
     try:
-        msg = {
+        message = {
             "type": "command",
             "cmd": cmd,
             "timeout": 10.0
         }
-        await _websocket.send(json.dumps(msg))
+        await _ws_client.send(json.dumps(message))
+        _terminal_output.append(f"[cyan]$ {cmd}[/]")
     except Exception as e:
-        _command_error = str(e)
+        _terminal_output.append(f"[red]Erreur : {e}[/]")
 
 
 async def receive_loop(uri: str, live: Live):
-    global _status, _latency_ms, _last_data, _command_output, _command_error, _websocket
+    global _status, _latency_ms, _last_data, _ws_client, _terminal_output, _command_input
 
     reconnect_delay = 2
 
@@ -218,8 +200,8 @@ async def receive_loop(uri: str, live: Live):
         try:
             _status = f"Connexion à {uri}…"
             async with websockets.connect(uri, open_timeout=5) as ws:
-                _websocket = ws
-                _status = f"Connecté ✓  ({uri})"
+                _ws_client = ws
+                _status = f"Connecté ✓"
                 reconnect_delay = 2
                 async for raw in ws:
                     t0 = time.perf_counter()
@@ -229,82 +211,75 @@ async def receive_loop(uri: str, live: Live):
                     msg_type = data.get("type", "metrics")
                     
                     if msg_type == "metrics":
-                        # Mise à jour des métriques
                         cpu_hist.append(data.get("cpu", {}).get("usage_pct", 0))
                         ram_hist.append(data.get("ram", {}).get("pct", 0))
                         if data.get("gpu", {}).get("available"):
                             gpu_hist.append(data["gpu"]["usage_pct"])
                         _last_data = data
-                        live.update(build_layout(data))
                     
                     elif msg_type == "command_result":
-                        # Résultat de commande
-                        cmd = data.get("cmd", "")
-                        status = data.get("status", "unknown")
-                        if status == "ok":
-                            _command_output = data.get("stdout", "") or data.get("stderr", "")
-                            _command_error = ""
+                        output = data.get("stdout", "") + data.get("stderr", "")
+                        if output:
+                            _terminal_output.append(f"[green]{output}[/]")
                         else:
-                            _command_error = data.get("error", "Erreur inconnue")
-                            _command_output = ""
-                        live.update(build_layout(_last_data))
+                            _terminal_output.append("[dim](pas de résultat)[/]")
+                    
+                    live.update(build_layout(_last_data))
 
         except (OSError, websockets.exceptions.WebSocketException) as e:
-            _status = f"Erreur : {e}  — reconnexion dans {reconnect_delay}s"
-            _websocket = None
+            _ws_client = None
+            _status = f"Erreur : reconnexion dans {reconnect_delay}s"
             if _last_data:
                 live.update(build_layout(_last_data))
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 30)
 
 
-async def command_input_loop(live: Live):
-    """Boucle pour saisie de commandes dans le terminal."""
+async def input_handler(live: Live):
+    """Gère l'input clavier"""
+    global _command_input
+    
     loop = asyncio.get_event_loop()
+    
     while True:
+        # Lire une ligne depuis l'input
         try:
-            # Saisie bloquante dans un thread pour ne pas bloquer asyncio
-            cmd = await loop.run_in_executor(None, lambda: input("$ "))
-            if cmd.lower() == "q":
-                return
-            if cmd.strip():
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+            cmd = line.strip()
+            
+            if cmd.lower() == 'q':
+                break
+            elif cmd:
+                _command_input = ""
                 await send_command(cmd)
-                await asyncio.sleep(0.1)
-        except KeyboardInterrupt:
-            return
-        except EOFError:
-            await asyncio.sleep(0.5)
+        except:
+            break
 
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 
 def run():
-    parser = argparse.ArgumentParser(description="RP2040 Monitor — Dashboard TUI")
-    parser.add_argument("host", help="IP ou hostname du PC cible (PC2)")
-    parser.add_argument("--port", default=9000, type=int, help="Port WebSocket (défaut : 9000)")
+    parser = argparse.ArgumentParser(description="RP2040 Monitor — Dashboard v2")
+    parser.add_argument("host", help="IP ou hostname du PC cible")
+    parser.add_argument("--port", default=9000, type=int)
     args = parser.parse_args()
 
     uri = f"ws://{args.host}:{args.port}"
-
     empty = {"ts": time.time(), "host": args.host, "cpu": {}, "ram": {}, "disk": {}, "gpu": {}}
 
-    async def main_loop():
-        with Live(build_layout(empty), console=console, refresh_per_second=2, screen=True) as live:
-            try:
+    with Live(build_layout(empty), console=console, refresh_per_second=2, screen=True) as live:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            async def main():
                 await asyncio.gather(
                     receive_loop(uri, live),
-                    command_input_loop(live),
-                    return_exceptions=True,
+                    input_handler(live),
+                    return_exceptions=True
                 )
-            except KeyboardInterrupt:
-                pass
-
-    try:
-        asyncio.run(main_loop())
-    except KeyboardInterrupt:
-        pass
+            
+            loop.run_until_complete(main())
+        except KeyboardInterrupt:
+            pass
 
     console.print("[bold green]Dashboard fermé.[/]")
 
